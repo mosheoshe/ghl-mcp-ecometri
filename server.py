@@ -1,19 +1,13 @@
 import os, json, httpx
-from starlette.applications import Starlette
-from starlette.routing import Route, Mount
-from starlette.responses import Response
-import uvicorn
-from mcp.server import Server
-from mcp.server.sse import SseServerTransport
-from mcp.types import Tool, TextContent
+from mcp.server.fastmcp import FastMCP
 
 GHL_API_KEY = os.environ.get("GHL_API_KEY", "")
 GHL_LOCATION_ID = os.environ.get("GHL_LOCATION_ID", "")
 BASE_URL = "https://services.leadconnectorhq.com"
 HEADERS = {"Authorization": f"Bearer {GHL_API_KEY}", "Version": "2021-07-28", "Content-Type": "application/json"}
-PORT = int(os.environ.get("PORT", 8000))
+PORT = int(os.environ.get("PORT", 8080))
 
-mcp = Server("ghl-ecometri")
+mcp = FastMCP("GHL Ecometri", host="0.0.0.0", port=PORT)
 
 async def ghl_get(path, params={}):
     async with httpx.AsyncClient(timeout=30) as client:
@@ -21,81 +15,62 @@ async def ghl_get(path, params={}):
         r.raise_for_status()
         return r.json()
 
-@mcp.list_tools()
-async def list_tools():
-    return [
-        Tool(name="get_contacts_by_tag", description="Get all contacts with a specific tag",
-             inputSchema={"type":"object","required":["tag"],"properties":{"tag":{"type":"string"},"max_pages":{"type":"integer"}}}),
-        Tool(name="get_contact", description="Get full contact details",
-             inputSchema={"type":"object","required":["contact_id"],"properties":{"contact_id":{"type":"string"}}}),
-        Tool(name="get_pipelines", description="Get all pipelines and stages",
-             inputSchema={"type":"object","properties":{}}),
-        Tool(name="get_opportunities", description="Get deals/opportunities",
-             inputSchema={"type":"object","properties":{"pipeline_id":{"type":"string"},"stage_id":{"type":"string"},"limit":{"type":"integer"}}}),
-        Tool(name="get_custom_fields", description="Get all custom field definitions",
-             inputSchema={"type":"object","properties":{}}),
-        Tool(name="get_workflows", description="Get all workflows",
-             inputSchema={"type":"object","properties":{}}),
-        Tool(name="get_location_stats", description="Get total contacts, pipelines, workflows",
-             inputSchema={"type":"object","properties":{}}),
-    ]
+@mcp.tool()
+async def get_contacts_by_tag(tag: str, max_pages: int = 10) -> str:
+    """Get ALL contacts with a specific tag from GHL, auto-paginated"""
+    all_contacts, skip = [], 0
+    for _ in range(max_pages):
+        data = await ghl_get("/contacts/", {"locationId": GHL_LOCATION_ID, "tags": tag, "limit": 100, "skip": skip})
+        batch = data.get("contacts", [])
+        all_contacts.extend(batch)
+        if len(batch) < 100: break
+        skip += 100
+    return json.dumps({"total": len(all_contacts), "contacts": all_contacts}, ensure_ascii=False)
 
-@mcp.call_tool()
-async def call_tool(name, arguments):
-    try:
-        if name == "get_contacts_by_tag":
-            tag = arguments["tag"]
-            max_pages = arguments.get("max_pages", 10)
-            all_contacts, skip = [], 0
-            for _ in range(max_pages):
-                data = await ghl_get("/contacts/", {"locationId": GHL_LOCATION_ID, "tags": tag, "limit": 100, "skip": skip})
-                batch = data.get("contacts", [])
-                all_contacts.extend(batch)
-                if len(batch) < 100: break
-                skip += 100
-            result = {"total": len(all_contacts), "contacts": all_contacts}
-        elif name == "get_contact":
-            result = await ghl_get(f"/contacts/{arguments['contact_id']}")
-        elif name == "get_pipelines":
-            result = await ghl_get("/opportunities/pipelines", {"locationId": GHL_LOCATION_ID})
-        elif name == "get_opportunities":
-            params = {"location_id": GHL_LOCATION_ID, "limit": arguments.get("limit", 100)}
-            if arguments.get("pipeline_id"): params["pipeline_id"] = arguments["pipeline_id"]
-            if arguments.get("stage_id"): params["pipeline_stage_id"] = arguments["stage_id"]
-            result = await ghl_get("/opportunities/search", params)
-        elif name == "get_custom_fields":
-            result = await ghl_get("/custom-fields/", {"locationId": GHL_LOCATION_ID})
-        elif name == "get_workflows":
-            result = await ghl_get("/workflows/", {"locationId": GHL_LOCATION_ID})
-        elif name == "get_location_stats":
-            c = await ghl_get("/contacts/", {"locationId": GHL_LOCATION_ID, "limit": 1})
-            p = await ghl_get("/opportunities/pipelines", {"locationId": GHL_LOCATION_ID})
-            w = await ghl_get("/workflows/", {"locationId": GHL_LOCATION_ID})
-            result = {"total_contacts": c.get("meta",{}).get("total","?"), "pipelines": len(p.get("pipelines",[])), "workflows": len(w.get("workflows",[]))}
-        else:
-            result = {"error": f"Unknown tool: {name}"}
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
-    except Exception as e:
-        return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+@mcp.tool()
+async def get_contact(contact_id: str) -> str:
+    """Get full details of a single GHL contact including all custom fields"""
+    result = await ghl_get(f"/contacts/{contact_id}")
+    return json.dumps(result, ensure_ascii=False)
 
-sse = SseServerTransport("/messages/")
+@mcp.tool()
+async def get_pipelines() -> str:
+    """Get all GHL pipelines and their stages"""
+    result = await ghl_get("/opportunities/pipelines", {"locationId": GHL_LOCATION_ID})
+    return json.dumps(result, ensure_ascii=False)
 
-async def handle_sse(request):
-    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
-        await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
+@mcp.tool()
+async def get_opportunities(pipeline_id: str = "", stage_id: str = "", limit: int = 100) -> str:
+    """Get deals/opportunities from GHL pipeline"""
+    params = {"location_id": GHL_LOCATION_ID, "limit": limit}
+    if pipeline_id: params["pipeline_id"] = pipeline_id
+    if stage_id: params["pipeline_stage_id"] = stage_id
+    result = await ghl_get("/opportunities/search", params)
+    return json.dumps(result, ensure_ascii=False)
 
-async def handle_messages(request):
-    await sse.handle_post_message(request.scope, request.receive, request._send)
+@mcp.tool()
+async def get_custom_fields() -> str:
+    """Get all custom field definitions for this GHL location"""
+    result = await ghl_get("/custom-fields/", {"locationId": GHL_LOCATION_ID})
+    return json.dumps(result, ensure_ascii=False)
 
-async def health(request):
-    return Response("GHL MCP OK", status_code=200)
+@mcp.tool()
+async def get_workflows() -> str:
+    """Get all GHL workflows and their enrollment stats"""
+    result = await ghl_get("/workflows/", {"locationId": GHL_LOCATION_ID})
+    return json.dumps(result, ensure_ascii=False)
 
-app = Starlette(routes=[
-    Route("/", health),
-    Route("/health", health),
-    Route("/sse", handle_sse),
-    Mount("/messages/", app=handle_messages),
-])
+@mcp.tool()
+async def get_location_stats() -> str:
+    """Get total contacts, pipelines and workflows count for this GHL location"""
+    c = await ghl_get("/contacts/", {"locationId": GHL_LOCATION_ID, "limit": 1})
+    p = await ghl_get("/opportunities/pipelines", {"locationId": GHL_LOCATION_ID})
+    w = await ghl_get("/workflows/", {"locationId": GHL_LOCATION_ID})
+    return json.dumps({
+        "total_contacts": c.get("meta", {}).get("total", "?"),
+        "pipelines": len(p.get("pipelines", [])),
+        "workflows": len(w.get("workflows", []))
+    })
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    mcp.run(transport="streamable-http")
